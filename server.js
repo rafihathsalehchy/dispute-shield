@@ -10,11 +10,12 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ── SHOPIFY API SETUP ─────────────────────────────────────
-const shopify = shopifyApi({
+const SETUP_MODE = !process.env.SHOPIFY_API_KEY || process.env.SHOPIFY_API_KEY === 'PLACEHOLDER';
+const shopify = SETUP_MODE ? null : shopifyApi({
   apiKey: process.env.SHOPIFY_API_KEY,
   apiSecretKey: process.env.SHOPIFY_API_SECRET,
-  scopes: process.env.SHOPIFY_SCOPES.split(','),
-  hostName: process.env.SHOPIFY_APP_URL.replace(/https?:\/\//, ''),
+  scopes: (process.env.SHOPIFY_SCOPES || '').split(','),
+  hostName: (process.env.SHOPIFY_APP_URL || 'localhost').replace(/https?:\/\//, ''),
   apiVersion: ApiVersion.January24,
   isEmbeddedApp: false,
   sessionStorage: {
@@ -31,6 +32,14 @@ const shopify = shopifyApi({
     deleteSession: async (id) => { db.deleteSession(id); return true; },
   },
 });
+
+// ── SETUP MODE ───────────────────────────────────────────
+if (SETUP_MODE) {
+  app.get('*', (req, res) => res.json({ status: 'setup', message: 'Dispute Shield is running. Set SHOPIFY_API_KEY to activate.' }));
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`🛡️ Dispute Shield (setup mode) on port ${PORT}`));
+  return;
+}
 
 // ── OAUTH: BEGIN ──────────────────────────────────────────
 app.get('/auth', async (req, res) => {
