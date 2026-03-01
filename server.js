@@ -1,207 +1,165 @@
 require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
-const { shopifyApi, ApiVersion, Session } = require('@shopify/shopify-api');
-const { restResources } = require('@shopify/shopify-api/rest/admin/2024-01');
-const db = require('./db');
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── SHOPIFY API SETUP ─────────────────────────────────────
-const SETUP_MODE = !process.env.SHOPIFY_API_KEY || process.env.SHOPIFY_API_KEY === 'PLACEHOLDER';
-const shopify = SETUP_MODE ? null : shopifyApi({
-  apiKey: process.env.SHOPIFY_API_KEY,
-  apiSecretKey: process.env.SHOPIFY_API_SECRET,
-  scopes: (process.env.SHOPIFY_SCOPES || '').split(','),
-  hostName: (process.env.SHOPIFY_APP_URL || 'localhost').replace(/https?:\/\//, ''),
-  apiVersion: ApiVersion.January24,
-  isEmbeddedApp: false,
-  sessionStorage: {
-    storeSession: async (session) => { db.saveSession(session); return true; },
-    loadSession: async (id) => {
-      const row = db.loadSession(id);
-      if (!row) return undefined;
-      const s = new Session({ id: row.id, shop: row.shop, state: row.state, isOnline: !!row.isOnline });
-      s.scope = row.scope;
-      s.accessToken = row.accessToken;
-      s.expires = row.expires ? new Date(row.expires) : undefined;
-      return s;
-    },
-    deleteSession: async (id) => { db.deleteSession(id); return true; },
-  },
-});
+// Strip quotes Railway raw editor may add around values
+const env = (key) => (process.env[key] || '').replace(/^["']|["']$/g, '').trim();
 
-// ── SETUP MODE ───────────────────────────────────────────
+const SHOPIFY_API_KEY    = env('SHOPIFY_API_KEY');
+const SHOPIFY_API_SECRET = env('SHOPIFY_API_SECRET');
+const SHOPIFY_APP_URL    = env('SHOPIFY_APP_URL') || 'http://localhost:3000';
+const SHOPIFY_SCOPES     = env('SHOPIFY_SCOPES') || 'read_shopify_payments_dispute_evidences,write_shopify_payments_dispute_evidences';
+const INTERNAL_SECRET    = env('INTERNAL_API_SECRET');
+const PORT               = parseInt(env('PORT') || '3000', 10);
+
+const SETUP_MODE = !SHOPIFY_API_KEY || SHOPIFY_API_KEY === 'PLACEHOLDER';
+
+// ── HEALTH CHECK (always up) ─────────────────────────────
+app.get('/', (req, res) => res.json({
+  status: SETUP_MODE ? 'setup' : 'ok',
+  app: 'Dispute Shield',
+  mode: SETUP_MODE ? 'setup' : 'active',
+}));
+
 if (SETUP_MODE) {
-  app.get('*', (req, res) => res.json({ status: 'setup', message: 'Dispute Shield is running. Set SHOPIFY_API_KEY to activate.' }));
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => console.log(`🛡️ Dispute Shield (setup mode) on port ${PORT}`));
-  return;
-}
-
-// ── OAUTH: BEGIN ──────────────────────────────────────────
-app.get('/auth', async (req, res) => {
-  const shop = req.query.shop;
-  if (!shop) return res.status(400).send('Missing shop parameter');
-  await shopify.auth.begin({ shop, callbackPath: '/auth/callback', isOnline: false, rawRequest: req, rawResponse: res });
-});
-
-// ── OAUTH: CALLBACK ───────────────────────────────────────
-app.get('/auth/callback', async (req, res) => {
+  console.log('⚠️  Dispute Shield running in setup mode — set SHOPIFY_API_KEY to activate');
+  app.use((req, res) => res.json({ status: 'setup', message: 'Set SHOPIFY_API_KEY to activate.' }));
+  app.listen(PORT, () => console.log(`🛡️ Dispute Shield (setup) on port ${PORT}`));
+} else {
+  // Lazy-load shopify to avoid crash at startup
+  let shopify;
   try {
-    const callback = await shopify.auth.callback({ rawRequest: req, rawResponse: res });
-    const session = callback.session;
-    await shopify.sessionStorage.storeSession(session);
-    console.log(`✅ Installed on ${session.shop} | scope: ${session.scope}`);
-    res.redirect(`/dashboard?shop=${session.shop}`);
-  } catch (e) {
-    console.error('Auth callback error:', e);
-    res.status(500).send(`Auth failed: ${e.message}`);
-  }
-});
+    const { shopifyApi, ApiVersion, Session } = require('@shopify/shopify-api');
+    const db = require('./db');
 
-// ── DASHBOARD ─────────────────────────────────────────────
-app.get('/dashboard', (req, res) => {
-  const shop = req.query.shop || 'unknown';
-  const session = db.findSessionByShop(shop);
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Dispute Shield</title>
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 800px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
-        .card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 32px; margin: 24px 0; }
-        .badge { display: inline-block; background: #d1fae5; color: #065f46; padding: 4px 12px; border-radius: 20px; font-size: 13px; font-weight: 600; }
-        h1 { font-size: 28px; margin-bottom: 4px; }
-        .sub { color: #6b7280; margin-bottom: 32px; }
-        code { background: #1f2937; color: #f9fafb; padding: 16px; border-radius: 8px; display: block; font-size: 13px; line-height: 1.6; white-space: pre; overflow-x: auto; }
-      </style>
-    </head>
-    <body>
-      <h1>🛡️ Dispute Shield</h1>
-      <p class="sub">Automated dispute evidence submission for Shopify Payments</p>
-      <div class="card">
-        <span class="badge">✅ Connected</span>
-        <p style="margin-top:16px"><strong>Shop:</strong> ${shop}</p>
-        <p><strong>Scope:</strong> ${session?.scope || 'checking...'}</p>
-        <p><strong>Status:</strong> Active and ready to receive dispute evidence</p>
-      </div>
-      <div class="card">
-        <h3>API Endpoint</h3>
-        <p>Your Chargeback Defender calls this endpoint to submit evidence:</p>
-        <code>POST /api/submit-dispute-evidence
-Content-Type: application/json
-X-Internal-Secret: &lt;your secret&gt;
-
-{
-  "shop": "yourstore.myshopify.com",
-  "disputeId": "gid://shopify/ShopifyPaymentsDispute/123",
-  "evidence": {
-    "customerEmailAddress": "customer@email.com",
-    "customerFirstName": "Jane",
-    "customerLastName": "Doe",
-    "shippingAddress": { ... },
-    "fulfillmentDocumentation": "tracking info...",
-    "refundPolicyDisclosure": "All sales final per TOS",
-    "cancellationPolicyDisclosure": "No cancellations after shipping"
-  }
-}</code>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-// ── INTERNAL API: SUBMIT DISPUTE EVIDENCE ─────────────────
-app.post('/api/submit-dispute-evidence', async (req, res) => {
-  // Verify internal secret
-  const secret = req.headers['x-internal-secret'];
-  if (secret !== process.env.INTERNAL_API_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const { shop, disputeId, evidence } = req.body;
-  if (!shop || !disputeId || !evidence) {
-    return res.status(400).json({ error: 'Missing shop, disputeId, or evidence' });
-  }
-
-  try {
-    // Load session for this shop
-    const sessionRow = db.findSessionByShop(shop);
-    if (!sessionRow || !sessionRow.accessToken) {
-      return res.status(404).json({ error: `No session found for ${shop}. Install the app first.` });
-    }
-
-    // Build GraphQL mutation
-    const mutation = `
-      mutation disputeEvidenceUpdate($id: ID!, $disputeEvidence: ShopifyPaymentsDisputeEvidenceUpdateInput!) {
-        disputeEvidenceUpdate(id: $id, disputeEvidence: $disputeEvidence) {
-          disputeEvidence {
-            id
-            submittedByMerchant
-          }
-          userErrors {
-            field
-            message
-          }
-        }
-      }
-    `;
-
-    const variables = {
-      id: disputeId,
-      disputeEvidence: {
-        customerEmailAddress: evidence.customerEmailAddress,
-        customerFirstName: evidence.customerFirstName,
-        customerLastName: evidence.customerLastName,
-        uncategorizedText: evidence.uncategorizedText || '',
-        fulfillmentDocumentation: evidence.fulfillmentDocumentation || '',
-        refundPolicyDisclosure: evidence.refundPolicyDisclosure || '',
-        cancellationPolicyDisclosure: evidence.cancellationPolicyDisclosure || '',
-        additionalDocumentation: evidence.additionalDocumentation || '',
-        submitForReview: true,
-      }
-    };
-
-    if (evidence.shippingAddress) {
-      variables.disputeEvidence.shippingAddress = evidence.shippingAddress;
-    }
-
-    const response = await fetch(`https://${shop}/admin/api/2024-01/graphql.json`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Shopify-Access-Token': sessionRow.accessToken,
+    shopify = shopifyApi({
+      apiKey: SHOPIFY_API_KEY,
+      apiSecretKey: SHOPIFY_API_SECRET,
+      scopes: SHOPIFY_SCOPES.split(',').map(s => s.trim()),
+      hostName: SHOPIFY_APP_URL.replace(/https?:\/\//, ''),
+      apiVersion: ApiVersion.January24,
+      isEmbeddedApp: false,
+      sessionStorage: {
+        storeSession: async (session) => { db.saveSession(session); return true; },
+        loadSession: async (id) => {
+          const row = db.loadSession(id);
+          if (!row) return undefined;
+          const s = new Session({ id: row.id, shop: row.shop, state: row.state, isOnline: !!row.isOnline });
+          s.scope = row.scope;
+          s.accessToken = row.accessToken;
+          s.expires = row.expires ? new Date(row.expires) : undefined;
+          return s;
+        },
+        deleteSession: async (id) => { db.deleteSession(id); return true; },
       },
-      body: JSON.stringify({ query: mutation, variables }),
+    });
+    console.log(`✅ Shopify API initialized | key: ${SHOPIFY_API_KEY.slice(0,8)}...`);
+
+    // ── OAUTH: BEGIN ────────────────────────────────────────
+    app.get('/auth', async (req, res) => {
+      const shop = req.query.shop;
+      if (!shop) return res.status(400).send('Missing shop parameter');
+      try {
+        await shopify.auth.begin({ shop, callbackPath: '/auth/callback', isOnline: false, rawRequest: req, rawResponse: res });
+      } catch (e) {
+        console.error('Auth begin error:', e);
+        res.status(500).send('OAuth error: ' + e.message);
+      }
     });
 
-    const result = await response.json();
-    const errors = result.data?.disputeEvidenceUpdate?.userErrors;
+    // ── OAUTH: CALLBACK ─────────────────────────────────────
+    app.get('/auth/callback', async (req, res) => {
+      try {
+        const callback = await shopify.auth.callback({ rawRequest: req, rawResponse: res });
+        const session = callback.session;
+        await shopify.sessionStorage.storeSession(session);
+        console.log(`✅ Installed on ${session.shop}`);
+        res.redirect(`/dashboard?shop=${session.shop}`);
+      } catch (e) {
+        console.error('Auth callback error:', e);
+        res.status(500).send('OAuth callback error: ' + e.message);
+      }
+    });
 
-    if (errors && errors.length > 0) {
-      return res.status(422).json({ error: 'Shopify errors', details: errors });
-    }
+    // ── DASHBOARD ───────────────────────────────────────────
+    app.get('/dashboard', async (req, res) => {
+      const shop = req.query.shop;
+      if (!shop) return res.status(400).send('Missing shop parameter');
+      const session = db.findSessionByShop(shop);
+      if (!session || !session.accessToken) {
+        return res.redirect(`/auth?shop=${shop}`);
+      }
+      res.send(`
+        <html><body style="font-family:sans-serif;padding:40px">
+        <h1>🛡️ Dispute Shield</h1>
+        <p>✅ Connected to <strong>${shop}</strong></p>
+        <p>Scope: <code>${session.scope || 'N/A'}</code></p>
+        <hr/>
+        <h3>API Endpoint</h3>
+        <p><code>POST /api/submit-dispute-evidence</code></p>
+        <p>Header: <code>X-Internal-Secret: [your secret]</code></p>
+        </body></html>
+      `);
+    });
 
-    console.log(`✅ Evidence submitted for dispute ${disputeId} on ${shop}`);
-    res.json({ success: true, data: result.data?.disputeEvidenceUpdate?.disputeEvidence });
+    // ── SUBMIT DISPUTE EVIDENCE ────────────────────────────
+    app.post('/api/submit-dispute-evidence', async (req, res) => {
+      const secret = req.headers['x-internal-secret'];
+      if (!INTERNAL_SECRET || secret !== INTERNAL_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
 
-  } catch (e) {
-    console.error('Evidence submission error:', e);
-    res.status(500).json({ error: e.message });
+      const { shop, disputeId, evidence } = req.body;
+      if (!shop || !disputeId) {
+        return res.status(400).json({ error: 'Missing shop or disputeId' });
+      }
+
+      const session = db.findSessionByShop(shop);
+      if (!session || !session.accessToken) {
+        return res.status(403).json({ error: `No session for ${shop}. Install the app first.` });
+      }
+
+      const mutation = `
+        mutation disputeEvidenceUpdate($id: ID!, $input: ShopifyPaymentsDisputeEvidenceInput!) {
+          disputeEvidenceUpdate(id: $id, input: $input) {
+            disputeEvidence { submittedByMerchant }
+            userErrors { field message }
+          }
+        }
+      `;
+
+      try {
+        const client = new shopify.clients.Graphql({ session: new (require('@shopify/shopify-api').Session)(session) });
+        const response = await client.query({
+          data: {
+            query: mutation,
+            variables: {
+              id: `gid://shopify/ShopifyPaymentsDispute/${disputeId}`,
+              input: { ...evidence, submitForReview: true },
+            },
+          },
+        });
+
+        const result = response.body?.data?.disputeEvidenceUpdate;
+        if (result?.userErrors?.length) {
+          return res.status(422).json({ error: 'Shopify errors', details: result.userErrors });
+        }
+        return res.json({ ok: true, submitted: result?.disputeEvidence?.submittedByMerchant });
+      } catch (e) {
+        console.error('Evidence submit error:', e);
+        return res.status(500).json({ error: e.message });
+      }
+    });
+
+  } catch (initError) {
+    console.error('❌ Shopify init failed:', initError.message);
+    app.use((req, res) => res.status(500).json({ status: 'error', message: initError.message }));
   }
-});
 
-// ── HEALTH CHECK ──────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', app: 'Dispute Shield', version: '1.0.0' });
-});
-
-// ── START ─────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🛡️ Dispute Shield running on port ${PORT}`));
-
-// v1772388057
+  app.listen(PORT, () => console.log(`🛡️ Dispute Shield on port ${PORT} | shop key: ${SHOPIFY_API_KEY.slice(0,8)}...`));
+}
+// v1741880000
